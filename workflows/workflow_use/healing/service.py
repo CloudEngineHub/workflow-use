@@ -488,7 +488,6 @@ class HealingService:
 			controller=CapturingController(self.selector_generator),  # Pass selector_generator to controller
 			enable_memory=False,
 			max_failures=10,
-			tool_calling_method='auto',
 		)
 
 		# Store the element map for later use
