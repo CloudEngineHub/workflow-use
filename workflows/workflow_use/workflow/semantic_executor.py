@@ -21,7 +21,9 @@ from workflow_use.schema.views import (
 	SelectChangeStep,
 	WorkflowStep,
 )
+from workflow_use.workflow.error_reporter import ErrorCategory, ErrorContext, ErrorReporter
 from workflow_use.workflow.semantic_extractor import SemanticExtractor
+from workflow_use.workflow.step_verifier import StepVerifier, VerificationResult
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +38,7 @@ class SemanticWorkflowExecutor:
 		max_global_failures: int = 5,
 		max_verification_failures: int = 3,
 		page_extraction_llm: BaseChatModel | None = None,
+		enable_step_verification: bool = False,  # Disabled by default until fully stable
 	):
 		self.browser = browser
 		self.semantic_extractor = SemanticExtractor()
@@ -48,6 +51,10 @@ class SemanticWorkflowExecutor:
 		self.consecutive_verification_failures = 0
 		self.last_successful_step = None
 		self.page_extraction_llm = page_extraction_llm
+		self.error_reporter = ErrorReporter()
+		self.current_step_index = 0
+		self.enable_step_verification = enable_step_verification
+		self.step_verifier = StepVerifier(llm=page_extraction_llm) if enable_step_verification else None
 
 	async def _get_elements_by_selector(self, selector: str):
 		"""Helper to get elements by CSS selector (CDP replacement for page.locator).
@@ -375,7 +382,7 @@ class SemanticWorkflowExecutor:
 
 		# Priority 1: Exact text match in semantic mapping (highest priority)
 		# This handles cases where the exact dynamic value was captured
-		logger.debug(f'[Priority 1] Searching for exact text matches')
+		logger.debug('[Priority 1] Searching for exact text matches')
 		for text, element_info in self.current_mapping.items():
 			text_stripped = text.split(' (in ')[0].strip()  # Remove context annotations
 
@@ -1834,6 +1841,7 @@ class SemanticWorkflowExecutor:
 
 		last_exception = None
 		last_result = None
+		pre_step_state = None
 
 		for attempt in range(self.max_retries + 1):  # +1 for initial attempt
 			try:
@@ -1843,6 +1851,10 @@ class SemanticWorkflowExecutor:
 					await self._refresh_semantic_mapping()
 					# Small delay before retry
 					await asyncio.sleep(1)
+
+				# Capture state before step execution (for deterministic verification)
+				if self.step_verifier:
+					pre_step_state = await self.step_verifier.capture_pre_step_state(self.browser)
 
 				# Execute the step
 				result = await step_executor()
@@ -1859,8 +1871,23 @@ class SemanticWorkflowExecutor:
 						logger.error(f'❌ Step caused validation errors after {self.max_retries} retries')
 						# Don't break here, let it continue to verification
 
-				# Verify the step was successful
-				verification_passed = await verification_method()
+				# Run comprehensive step verification if enabled
+				verification_passed = False
+				if self.step_verifier:
+					verification_outcome = await self.step_verifier.verify_step(step, self.browser, pre_step_state)
+
+					if verification_outcome.result == VerificationResult.SUCCESS:
+						verification_passed = True
+						logger.info(f'   ✅ Step verification passed (confidence: {verification_outcome.confidence:.1%})')
+					elif verification_outcome.result == VerificationResult.SKIPPED:
+						# No verification defined, fall back to original method
+						verification_passed = await verification_method()
+					else:
+						verification_passed = False
+						logger.warning(f'   ❌ Step verification failed: {verification_outcome.details}')
+				else:
+					# Fall back to original verification method
+					verification_passed = await verification_method()
 
 				if verification_passed and not validation_errors:
 					if attempt > 0:
@@ -1926,44 +1953,83 @@ class SemanticWorkflowExecutor:
 		self.global_failure_count += 1
 		self.consecutive_failures += 1
 
-		# Determine failure type and update appropriate counters
-		failure_type = 'execution'
+		# Determine failure type and error category
+		error_category = ErrorCategory.UNKNOWN
 		if last_exception and 'verification failed' in str(last_exception).lower():
 			self.consecutive_verification_failures += 1
-			failure_type = 'verification'
+			error_category = ErrorCategory.VERIFICATION_FAILED
 		elif last_exception and 'validation errors' in str(last_exception).lower():
-			failure_type = 'validation'
+			error_category = ErrorCategory.VALIDATION_ERROR
+		elif last_exception and any(
+			pattern in str(last_exception).lower() for pattern in ['element not found', 'no such element', 'selector failed']
+		):
+			error_category = ErrorCategory.ELEMENT_NOT_FOUND
+		elif last_exception and 'timeout' in str(last_exception).lower():
+			error_category = ErrorCategory.TIMEOUT
 		else:
-			failure_type = 'execution'
+			error_category = ErrorCategory.EXECUTION_FAILED
 
-		# Enhanced error reporting
-		error_context = {
-			'step_type': step.type if hasattr(step, 'type') else 'unknown',
-			'description': step.description if hasattr(step, 'description') else 'No description',
-			'target_text': getattr(step, 'target_text', None),
-			'value': getattr(step, 'value', None),
-			'failure_type': failure_type,
-			'global_failures': self.global_failure_count,
-			'consecutive_failures': self.consecutive_failures,
-			'consecutive_verification_failures': self.consecutive_verification_failures,
-			'last_successful_step': self.last_successful_step,
-		}
+		# Check for systematic failures
+		if self.consecutive_failures >= 3 or self.global_failure_count >= self.max_global_failures:
+			error_category = ErrorCategory.SYSTEMATIC_FAILURE
 
-		logger.error(f'❌ Step failed completely after {self.max_retries + 1} attempts. Context: {error_context}')
+		# Get page context and capture screenshot
+		screenshot_path = None
+		try:
+			page = await self.browser.get_current_page()
+			current_url = page.url if page else None
+			page_title = await page.title() if page else None
 
-		# Provide specific guidance based on failure patterns
-		if self.consecutive_verification_failures >= 2:
-			logger.warning('⚠️  Multiple consecutive verification failures detected. This may indicate:')
-			logger.warning('   • Steps are executing but not achieving expected results')
-			logger.warning('   • Form behavior has changed (validation rules, navigation flow)')
-			logger.warning('   • Data being entered is causing unexpected form states')
-			logger.warning('   • Page interactions are not waiting long enough for effects')
-		elif self.consecutive_failures >= 2:
-			logger.warning('⚠️  Multiple consecutive execution failures detected. This may indicate:')
-			logger.warning('   • Form structure has changed')
-			logger.warning('   • Invalid input data for current form state')
-			logger.warning('   • Element selectors are outdated')
-			logger.warning('   • Form validation is rejecting inputs')
+			# Capture error screenshot for debugging
+			try:
+				from pathlib import Path
+
+				# Create screenshots directory if it doesn't exist
+				screenshot_dir = Path('./.workflow_screenshots')
+				screenshot_dir.mkdir(exist_ok=True)
+
+				# Generate unique screenshot filename
+				from datetime import datetime
+
+				timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+				step_desc = step.description[:30].replace(' ', '_') if hasattr(step, 'description') else 'unknown'
+				screenshot_filename = f'error_{timestamp}_step{self.current_step_index}_{step_desc}.png'
+				screenshot_path = str(screenshot_dir / screenshot_filename)
+
+				# Capture screenshot
+				await page.screenshot(path=screenshot_path)
+				logger.info(f'📸 Error screenshot saved: {screenshot_path}')
+
+			except Exception as screenshot_error:
+				logger.debug(f'Failed to capture error screenshot: {screenshot_error}')
+
+		except Exception:
+			current_url = None
+			page_title = None
+
+		# Create comprehensive error context
+		error_ctx = ErrorContext(
+			step_type=step.type if hasattr(step, 'type') else 'unknown',
+			step_description=step.description if hasattr(step, 'description') else 'No description',
+			step_index=self.current_step_index,
+			error_category=error_category,
+			error_message=str(last_exception) if last_exception else f'Step failed after {self.max_retries + 1} attempts',
+			original_exception=last_exception,
+			strategies_attempted=getattr(self, '_current_strategy_attempts', []),
+			global_failure_count=self.global_failure_count,
+			consecutive_failures=self.consecutive_failures,
+			consecutive_verification_failures=self.consecutive_verification_failures,
+			retry_attempts=self.max_retries + 1,
+			target_text=getattr(step, 'target_text', None),
+			input_value=getattr(step, 'value', None),
+			last_successful_step=self.last_successful_step,
+			current_url=current_url,
+			page_title=page_title,
+			screenshot_path=screenshot_path,
+		)
+
+		# Generate and log comprehensive error report
+		error_report = self.error_reporter.report_error(error_ctx)
 
 		# Raise the last exception that occurred
 		if last_exception:
@@ -1975,78 +2041,38 @@ class SemanticWorkflowExecutor:
 
 	async def _detect_form_validation_errors(self) -> Dict[str, str]:
 		"""Detect form validation errors that might indicate invalid input data."""
+		from workflow_use.workflow.validation_utils import get_all_validation_errors
+
 		page = await self.browser.get_current_page()
 		validation_errors = {}
 
 		try:
-			# Common error message selectors
-			error_selectors = [
-				'.error',
-				'.error-message',
-				'.validation-error',
-				'.field-error',
-				'[role="alert"]',
-				'.alert-danger',
-				'.text-red',
-				'.text-error',
-				'.invalid-feedback',
-				'.form-error',
-				'.help-block.error',
-			]
+			# Use shared validation error detection utility
+			error_messages = await get_all_validation_errors(page)
 
-			for selector in error_selectors:
-				try:
-					error_elements = await page.get_elements_by_css_selector(selector)
-					for i, element in enumerate(error_elements):
-						if await self._element_is_visible(element):
-							error_text = await self._element_text_content(element)
-							if error_text and error_text.strip():
-								# Filter out browser internal scripts and long technical content
-								clean_text = error_text.strip()
-
-								# Skip if it looks like browser internal code
-								if any(
-									pattern in clean_text
-									for pattern in [
-										'document.getElementById',
-										'function addPageBinding',
-										'serializeAsCallArgument',
-										'__next_f',
-										'globalThis',
-										'self.__next_f',
-										'serializeAsCallArgument',
-									]
-								):
-									continue
-
-								# Skip very long messages (likely technical content)
-								if len(clean_text) > 200:
-									continue
-
-								# Only include messages that look like actual validation errors
-								if any(
-									pattern in clean_text.lower()
-									for pattern in [
-										'required',
-										'invalid',
-										'error',
-										'must',
-										'cannot',
-										'please',
-										'missing',
-										'incorrect',
-										'format',
-										'valid',
-										'enter',
-										'provide',
-										'field',
-										'complete',
-										'fill',
-									]
-								):
-									validation_errors[f'{selector}_{i}'] = clean_text
-				except Exception:
-					continue
+			# Filter to only include messages that look like actual validation errors
+			for i, error_text in enumerate(error_messages):
+				if any(
+					pattern in error_text.lower()
+					for pattern in [
+						'required',
+						'invalid',
+						'error',
+						'must',
+						'cannot',
+						'please',
+						'missing',
+						'incorrect',
+						'format',
+						'valid',
+						'enter',
+						'provide',
+						'field',
+						'complete',
+						'fill',
+					]
+				):
+					validation_errors[f'error_{i}'] = error_text
 
 			# Check for common validation patterns in text
 			if validation_errors:

@@ -170,7 +170,10 @@ class Workflow:
 				strategies = all_params['selectorStrategies']
 
 				logger.info(f'   🎯 Attempting semantic multi-strategy finding ({len(strategies)} strategies)')
-				result = await self.element_finder.find_element_with_strategies(strategies, self.browser)
+				result, strategy_attempts = await self.element_finder.find_element_with_strategies(strategies, self.browser)
+
+				# Store strategy attempts for error reporting
+				self._current_strategy_attempts = strategy_attempts
 
 				if result:
 					element_index, strategy_used = result
@@ -192,7 +195,7 @@ class Workflow:
 					# This way we leverage browser-use's robust action handling
 
 				else:
-					logger.warning(f'   ⚠️  Multi-strategy finding failed, falling back to full controller')
+					logger.warning('   ⚠️  Multi-strategy finding failed, falling back to full controller')
 
 			except Exception as e:
 				logger.warning(f'   ⚠️  Error in multi-strategy finding: {e}, falling back to full controller')
