@@ -168,37 +168,63 @@ class Workflow:
 		if action_name in ['click', 'input'] and all_params.get('selectorStrategies'):
 			try:
 				strategies = all_params['selectorStrategies']
+				target_text = all_params.get('target_text')  # Get target_text for validation
 
 				logger.info(f'   🎯 Attempting semantic multi-strategy finding ({len(strategies)} strategies)')
-				result, strategy_attempts = await self.element_finder.find_element_with_strategies(strategies, self.browser)
+				if target_text:
+					logger.info(f'   🎯 Validating target text: "{target_text}"')
+
+				result, strategy_attempts = await self.element_finder.find_element_with_strategies(
+					strategies, self.browser, target_text
+				)
 
 				# Store strategy attempts for error reporting
 				self._current_strategy_attempts = strategy_attempts
 
 				if result:
-					element_index, strategy_used = result
-					logger.info(f'   ✅ Element found at index {element_index} using strategy: {strategy_used.get("type")}')
+					element_index_or_xpath, strategy_used = result
+					strategy_type = strategy_used.get('type')
+					logger.info(f'   ✅ Element found using strategy: {strategy_type}')
 
-					# Use the found index to execute the action through browser-use's controller
-					# This ensures we use browser-use's native semantic action system
-					if action_name == 'click':
-						# Override the index param with our found index
-						params['index'] = element_index
-						logger.info(f'   ✅ Will click element at index {element_index} (semantic-only)')
+					# XPath strategies return a string, not an index
+					# They should be handled by semantic_executor, not here
+					if strategy_type == 'xpath':
+						logger.info('   ⚠️  XPath strategy found - this should be handled by semantic_executor, not service.py')
+						logger.info('   ⚠️  Falling back to full controller')
+					else:
+						# Semantic strategies return element index
+						element_index = element_index_or_xpath
+						logger.info(f'   ✅ Element found at index {element_index}')
 
-					elif action_name == 'input':
-						# Override the index param with our found index
-						params['index'] = element_index
-						logger.info(f'   ✅ Will input to element at index {element_index} (semantic-only)')
+						# Use the found index to execute the action through browser-use's controller
+						# This ensures we use browser-use's native semantic action system
+						if action_name == 'click':
+							# Override the index param with our found index
+							params['index'] = element_index
+							logger.info(f'   ✅ Will click element at index {element_index} (semantic-only)')
 
-					# Continue to controller execution below with updated index
-					# This way we leverage browser-use's robust action handling
+						elif action_name == 'input':
+							# Override the index param with our found index
+							params['index'] = element_index
+							logger.info(f'   ✅ Will input to element at index {element_index} (semantic-only)')
+
+						# Continue to controller execution below with updated index
+						# This way we leverage browser-use's robust action handling
 
 				else:
 					logger.warning('   ⚠️  Multi-strategy finding failed, falling back to full controller')
+					# If target_text was provided and we couldn't find it, raise an error
+					if target_text:
+						raise RuntimeError(
+							f'Element with target text "{target_text}" not found on the page. '
+							f'Tried {len(strategies)} strategies but none matched a visible element with this text.'
+						)
 
 			except Exception as e:
 				logger.warning(f'   ⚠️  Error in multi-strategy finding: {e}, falling back to full controller')
+				# Re-raise if it's our validation error
+				if 'target text' in str(e).lower():
+					raise
 
 		# Special handling for actions that don't accept any parameters
 		# These actions use NoParamsAction, so we pass an empty instance instead of {}
