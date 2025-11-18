@@ -70,29 +70,41 @@ class XPathOptimizer:
 	4. Include fallback strategies
 	"""
 
-	def optimize_xpath(self, absolute_xpath: str, element_info: Optional[Dict] = None) -> List[str]:
+	def optimize_xpath(self, absolute_xpath: str, element_info: Optional[Dict] = None, max_alternatives: int = 2) -> List[str]:
 		"""
 		Generate optimized XPath alternatives from an absolute XPath.
 
 		Args:
 		    absolute_xpath: Full XPath like /html/body/div[1]/div[2]/table/tbody/tr[3]/td[2]/a
 		    element_info: Optional dict with element details (tag, text, attributes, etc.)
+		    max_alternatives: Maximum number of alternatives to return (default: 2)
+		        - If max_alternatives <= 1: Returns ONLY the absolute xpath (no optimized alternatives)
+		        - If max_alternatives >= 2: Returns best N-1 optimized alternatives + absolute xpath fallback
 
 		Returns:
-		    List of XPath alternatives, ordered from most to least robust
+		    List of XPath alternatives (exactly max_alternatives), ordered from most to least robust
 
-		Example:
+		Examples:
 		    >>> optimizer = XPathOptimizer()
+
+		    >>> # max_alternatives=1 returns only absolute xpath
+		    >>> xpaths = optimizer.optimize_xpath(xpath, element_info, max_alternatives=1)
+		    >>> # Returns: [original_xpath]
+
+		    >>> # max_alternatives=2 returns 1 optimized + 1 absolute
 		    >>> xpaths = optimizer.optimize_xpath(
 		    ...     '/html/body/form/div[3]/table/tbody/tr[2]/td[3]/a',
 		    ...     {'tag': 'a', 'text': '12345', 'attributes': {'class': 'license-link'}},
+		    ...     max_alternatives=2,
 		    ... )
 		    >>> # Returns: [
-		    ...     '//table//tr[2]/td[3]/a',  # Table-anchored
-		    ...     '//a[contains(@class, "license-link")]',  # Class-based
-		    ...     '//a[contains(text(), "12345")]',  # Text-based
-		    ...     original_xpath  # Absolute fallback
+		    ...     '//table//tr[2]/td[3]/a',  # Best optimized
+		    ...     original_xpath              # Absolute fallback
 		    ... ]
+
+		    >>> # max_alternatives=3 returns 2 optimized + 1 absolute
+		    >>> xpaths = optimizer.optimize_xpath(xpath, element_info, max_alternatives=3)
+		    >>> # Returns: [optimized_1, optimized_2, original_xpath]
 		"""
 		alternatives = []
 
@@ -117,16 +129,28 @@ class XPathOptimizer:
 		if shortened_xpath and shortened_xpath != absolute_xpath:
 			alternatives.append(shortened_xpath)
 
-		# Strategy 5: Original absolute path (last resort)
-		alternatives.append(absolute_xpath)
-
 		# Remove duplicates while preserving order
 		seen = set()
 		unique_alternatives = []
 		for xpath in alternatives:
-			if xpath not in seen:
+			if xpath not in seen and xpath != absolute_xpath:
 				seen.add(xpath)
 				unique_alternatives.append(xpath)
+
+		logger.debug(
+			f'XPath optimizer: Generated {len(unique_alternatives)} unique alternatives before limiting (max_alternatives={max_alternatives})'
+		)
+
+		# Limit alternatives based on max_alternatives setting
+		if max_alternatives <= 1:
+			# If max is 1 or less, return ONLY the absolute xpath (no optimized alternatives)
+			unique_alternatives = [absolute_xpath]
+		else:
+			# Otherwise, keep best N-1 optimized alternatives and add absolute xpath as fallback
+			unique_alternatives = unique_alternatives[: max_alternatives - 1]
+			unique_alternatives.append(absolute_xpath)
+
+		logger.debug(f'XPath optimizer: Returning {len(unique_alternatives)} alternatives (limit={max_alternatives})')
 
 		return unique_alternatives
 
