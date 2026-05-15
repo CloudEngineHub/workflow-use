@@ -176,6 +176,8 @@ result = await workflow.run_with_no_ai()  # No LLM calls, uses semantic mapping
 Examples:
 - `examples/cloud_browser_demo.py` - Load recorded workflow and run on cloud
 
+Want to run browser workflows continuously from your own VPS or Telegram? See [Browser Use Box](https://browser-use.com/bux) and the [15-second TikTok demo](https://www.tiktok.com/@browser_use/video/7639824093721758989).
+
 ## Launch the GUI
 
 The Workflow UI provides a visual interface for managing, viewing, and executing workflows.
